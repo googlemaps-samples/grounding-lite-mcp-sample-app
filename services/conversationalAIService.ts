@@ -41,7 +41,7 @@ const MAX_INACTIVITY_MS = 30 * 60 * 1000; // User requested 30 minutes
 let chat: Chat | null = null;
 let turnCount = 0;
 let lastInteractionTimestamp = 0;
-const MODEL_NAME = 'gemini-2.5-flash-preview-09-2025'; //'gemini-3-flash-preview-09-2025';//'gemini-2.5-flash-preview-09-2025';//gemini-3-flash';// '
+const MODEL_NAME = 'gemini-flash-latest';
 
 let ai: GoogleGenAI | null = null;
 export let mcpClientInstance: McpClient | null = null;
