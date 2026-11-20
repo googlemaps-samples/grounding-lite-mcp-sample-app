@@ -15,7 +15,7 @@
   },
   "dependencies": {
     "@google/genai": "1.29.0",
-    "@modelcontextprotocol/sdk": "1.24.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "axios": "^1.13.2",
     "cheerio": "^1.1.2",
     "dotenv": "^17.2.3",
