@@ -26,6 +26,8 @@ dist-ssr
 #custom
 .env
 .env.local
+.env.*
+!.env.example
 
 # Production deployment script containing project specific details
 deploy_prod.sh

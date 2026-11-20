@@ -53,10 +53,9 @@ export default defineConfig(({ mode }) => {
       plugins: [
         tailwindcss(),
       ],
-        define: {
+      define: {
         'process.env.GOOGLE_MAPS_API_KEY': JSON.stringify(env.GOOGLE_MAPS_API_KEY),
-        'process.env.SERVER_API_KEY': JSON.stringify(env.SERVER_API_KEY),
-     },
+      },
       resolve: {
         alias: {
           '@modelcontextprotocol/sdk/client/websocket.js': '@modelcontextprotocol/sdk/dist/client/websocket.js',
