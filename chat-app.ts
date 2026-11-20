@@ -268,31 +268,54 @@ export class ChatApp extends LitElement {
 
     // 1. Handle Route Request
     if (answer.startsWith('Show me the route to') && this.lastSelectedPlace) {
-      this.userInput = `Show me the route to the selected location with placeId ${this.lastSelectedPlace.id}`;
+      const placeName = cleanPlaceName(this.lastSelectedPlace.displayName) || this.lastSelectedPlace.formattedAddress || 'the selected location';
+      this.userInput = `Show me the route to ${placeName}`;
       this.handleSendMessage();
       return;
     }
 
-    // 2. Handle Weather Query (Existing Logic)
-    if (answer.startsWith('What is the weather at') && this.mapDisplayData.places && this.mapDisplayData.places.length > 0) {
-      const firstPlace = this.mapDisplayData.places[0];
-      if (firstPlace.location) {
-        // Temporarily set loading state while we geocode
-        this.isLoading = true;
-
-        const resolvedAddress = firstPlace.formattedAddress || cleanPlaceName(firstPlace.displayName);
-
-        // Reset loading state
-        this.isLoading = false;
-
-        if (resolvedAddress) {
-          // Append the resolved address to the user's input for unambiguous context
-          this.userInput = `${answer} (near ${resolvedAddress})`;
-        } else {
-          // Fallback to the original place name if geocoding fails
-          this.userInput = answer;
-        }
+    // 2. Handle Weather Query for Place
+    if (answer.startsWith('What is the weather at this place') && (this.lastSelectedPlace || (this.mapDisplayData.places && this.mapDisplayData.places.length > 0))) {
+      const place = this.lastSelectedPlace || this.mapDisplayData.places![0];
+      const resolvedAddress = place.formattedAddress || cleanPlaceName(place.displayName);
+      if (resolvedAddress) {
+        this.userInput = `What is the weather in ${resolvedAddress}?`;
       }
+    }
+
+    // 3. Handle Weather Query for Route Destination
+    if (answer.startsWith('What is the weather at the destination') && this.mapDisplayData.route?.destination) {
+      const dest = this.mapDisplayData.route.destination;
+      const destName = dest.name || (dest.place_id ? this.placeNamesCache.get(dest.place_id) : undefined) || dest.address;
+      if (destName) {
+        this.userInput = `What is the weather in ${destName}?`;
+      }
+    }
+
+    // 4. Handle Hotel queries
+    if (answer.startsWith('Find hotels near the destination') && this.mapDisplayData.route?.destination) {
+      const dest = this.mapDisplayData.route.destination;
+      const destName = dest.name || (dest.place_id ? this.placeNamesCache.get(dest.place_id) : undefined) || dest.address;
+      if (destName) {
+        this.userInput = `Find hotels near ${destName}`;
+      }
+    }
+
+    if (answer.startsWith('Find hotels near this place') && (this.lastSelectedPlace || (this.mapDisplayData.places && this.mapDisplayData.places.length > 0))) {
+      const place = this.lastSelectedPlace || this.mapDisplayData.places![0];
+      const placeName = cleanPlaceName(place.displayName) || place.formattedAddress || 'this location';
+      this.userInput = `Find hotels near ${placeName}`;
+    }
+
+    // 5. Handle Weather-based quick answers
+    if (answer.startsWith('Find restaurants near') && this.mapDisplayData.weather?.returnedLocation?.address) {
+      const loc = this.mapDisplayData.weather.returnedLocation.address;
+      this.userInput = `Find restaurants near ${loc}`;
+    }
+
+    if (answer.startsWith('Plan a route from here') && this.mapDisplayData.weather?.returnedLocation?.address) {
+      const loc = this.mapDisplayData.weather.returnedLocation.address;
+      this.userInput = `Plan a route from ${loc}`;
     }
 
     this.handleSendMessage();
@@ -354,6 +377,9 @@ export class ChatApp extends LitElement {
     this.initializeChat();
     this.setupLinkTracker();
     this.scrollToBottom(); // Ensure input field is visible on mobile load
+    if (this.mapRef) {
+      (this.mapRef as any).internalUsageAttributionIds = ['gmp_devsite_groundinglitesampleapp_v1.0.0'];
+    }
   }
 
   private setupLinkTracker() {
@@ -388,7 +414,14 @@ export class ChatApp extends LitElement {
     // Update Map camera, markers, routes, and weather when mapDisplayData changes
     if (changedProperties.has('mapDisplayData') && this.mapApiReady) {
       this.updateMapCamera();
-      this.fetchPlaceDetailsForMarkers(this.mapDisplayData.places);
+      const placesToFetch: Place[] = [...(this.mapDisplayData.places || [])];
+      if (this.mapDisplayData.route?.origin?.place_id) {
+        placesToFetch.push({ id: this.mapDisplayData.route.origin.place_id, formattedAddress: this.mapDisplayData.route.origin.name || this.mapDisplayData.route.origin.address });
+      }
+      if (this.mapDisplayData.route?.destination?.place_id) {
+        placesToFetch.push({ id: this.mapDisplayData.route.destination.place_id, formattedAddress: this.mapDisplayData.route.destination.name || this.mapDisplayData.route.destination.address });
+      }
+      this.fetchPlaceDetailsForMarkers(placesToFetch);
       // Only update markers imperatively if objects are initialized
     }
 
@@ -411,8 +444,7 @@ export class ChatApp extends LitElement {
         (g=>{var h,a,k,p="The Google Maps JavaScript API",c="google",l="importLibrary",q="__ib__",m=document,b=window;b=b[c]||(b[c]={});var d=b.maps||(b.maps={}),r=new Set,e=new URLSearchParams,u=()=>h||(h=new Promise(async(f,n)=>{await (a=m.createElement("script"));e.set("libraries",[...r]+"");for(k in g)e.set(k.replace(/[A-Z]/g,t=>"_"+t[0].toLowerCase()),g[k]);e.set("callback",c+".maps."+q);a.src=\`https://maps.\${c}apis.com/maps/api/js?\`+e;d[q]=f;a.onerror=()=>h=n(Error(p+" could not load."));a.nonce=m.querySelector("script[nonce]")?.nonce||"";m.head.append(a)}));d[l]?console.warn(p+" only loads once.Ignoring:",g):d[l]=(f,...n)=>r.add(f)&&u().then(()=>d[l](f,...n))})({
             key: "${GOOGLE_MAPS_API_KEY}",
             v: "weekly",
-            mapId: "749ac551edae0fb44cf73ee1",
-            internalUsageAttributionIds: ["gmp_devsite_groundinglitesampleapp_v1.0.0"]
+            solutionChannel: "gmp_devsite_groundinglitesampleapp_v1.0.0"
         });
     `;
     // DO NOT LINT
@@ -487,6 +519,23 @@ export class ChatApp extends LitElement {
     this.githubStarCount = await getRepoStarCount('googlemaps-samples/grounding-lite-mcp-sample-app');
   }
 
+  private getIntroMessageText(warning?: string): string {
+    const warningHtml = warning ? `<div class="p-3 mb-3 rounded-lg border border-amber-500/40 bg-amber-500/10 text-amber-200 text-xs">⚠️ ${warning}</div>\n\n` : '';
+    const modelDisplay = this.modelName ? `<div class="text-xs text-gray-400 mt-2 text-right">Powered by ${this.modelName}</div>` : '';
+    const githubButton = `
+              <a href="https://github.com/googlemaps-samples/grounding-lite-mcp-sample-app" target="_blank" style="display: inline-flex; align-items: center; vertical-align: middle;">
+                <img src="/images/github-icon.svg" alt="GitHub Icon" style="height: 1.2em; margin-right: 0.3em;"> GitHub Code ${this.githubStarCount !== null ? ` - Star &nbsp;<span>${this.githubStarCount}</span>` : ''}
+              </a>`;
+    const buttonContainer = `
+              <div style="text-align: right; margin-top: 1em; font-size: 0.8em;">
+                <a href="https://console.cloud.google.com/marketplace/product/google/mapstools.googleapis.com" target="_blank">Grounding Lite activate</a> |
+                <a href="https://developers.google.com/maps/ai/grounding-lite" target="_blank">documentation</a>
+                ${githubButton ? ` | ${githubButton}` : ''}
+              </div>
+            `;
+    return `${warningHtml}Hello! This is a demo travel planning app powered by Gemini and <span style="white-space: nowrap;font-weight:700"><img src="/images/Maps_Grounding_Lite.png" alt="Grounding Lite Icon" style="height: 2em; vertical-align: middle; display: inline-block;">Grounding Lite</span> MCP Service. Here we demonstrate how we can serve Google Maps Platform data as an embedding to any LLM powered application. This functionality enables the creation of diverse applications, such as a Travel Planner, Real Estate Explorer, or City Tour Guide. Try one of the sample prompts to explore!\n${modelDisplay}\n${buttonContainer}`;
+  }
+
   private async initializeChat() {
     await this.fetchGitHubStars();
     let errorMessages: string[] = [];
@@ -514,27 +563,11 @@ export class ChatApp extends LitElement {
         .then(({ success, modelName }) => {
           this.modelName = modelName;
           if (success) {
-            const modelDisplay = modelName ? `<div class="text-xs text-gray-400 mt-2 text-right">Powered by ${modelName}</div>` : '';
-            const githubButton = `
-              <a href="https://github.com/googlemaps-samples/grounding-lite-mcp-sample-app" target="_blank" style="display: inline-flex; align-items: center; vertical-align: middle;">
-                <img src="/images/github-icon.svg" alt="GitHub Icon" style="height: 1.2em;margin-right: 0.3em"> GitHub Code ${this.githubStarCount !== null ? ` - Star&nbsp;<span style="display: inline-flex; align-items: center; justify-content: center; width: 1.6em; height: 1.6em; background-color: #eeeeee; border-radius: 50%; color: darkgrey;">${this.githubStarCount}</span>` : ''}
-              </a>`; //  ${githubButton ? ` | ${githubButton}` : ''}
-            const buttonContainer = `
-              <div style="text-align: right; margin-top: 1em; font-size: 0.8em;">
-                <a href="https://console.cloud.google.com/marketplace/product/google/mapstools.googleapis.com" target="_blank">Grounding Lite activate</a> |
-                <a href="https://developers.google.com/maps/ai/grounding-lite" target="_blank">documentation</a>
-
-              </div>
-            `;
             this.chatHistory = [
               {
                 id: generateId(),
                 role: 'model',
-                parts: [{
-                  text: `Hello! This is a demo travel planning app powered by Gemini and <span style="white-space: nowrap;font-weight:700"><img src="/images/Maps_Grounding_Lite.png" alt="Grounding Lite Icon" style="height: 2em; vertical-align: middle; display: inline-block;">Grounding Lite</span> MCP Service. Here we demonstrate how we can serve Google Maps Platform data as an embedding to any LLM powered application. This functionality enables the creation of diverse applications, such as a Travel Planner, Real Estate Explorer, or City Tour Guide. Try one of the sample prompts to explore!
-${modelDisplay}
-${buttonContainer}`
-                }],
+                parts: [{ text: this.getIntroMessageText() }],
                 timestamp: new Date(),
               },
             ];
@@ -967,10 +1000,17 @@ ${buttonContainer}`
     return waypoint;
   }
 
-  private async processAiResponse(currentUserMessageText: string) {
+  private async processAiResponse(currentUserMessageText: string, retryAttempt = 0): Promise<void> {
     this.isLoading = true;
-    this.currentAiMessageIdRef = generateId();
-    this.addOrUpdateMessageInChat(this.currentAiMessageIdRef, 'model', [{ text: "Connecting to agent..." }], false);
+    if (retryAttempt === 0 || !this.currentAiMessageIdRef) {
+      this.currentAiMessageIdRef = generateId();
+      this.addOrUpdateMessageInChat(this.currentAiMessageIdRef, 'model', [{ text: "Connecting to agent..." }], false);
+    } else {
+      this.addOrUpdateMessageInChat(this.currentAiMessageIdRef, 'model', [{ text: "High demand detected, retrying automatically...\nPlease wait." }], false);
+    }
+
+    const MAX_AUTO_RETRIES = 2;
+    let streamError: string | null = null;
 
     try {
       const response = await fetch('/api/chat', {
@@ -992,8 +1032,10 @@ ${buttonContainer}`
       const processStream = async () => {
         const { done, value } = await reader.read();
         if (done) {
-          this.isLoading = false;
-          this.currentAiMessageIdRef = null;
+          if (!streamError) {
+            this.isLoading = false;
+            this.currentAiMessageIdRef = null;
+          }
           return;
         }
 
@@ -1015,8 +1057,25 @@ ${buttonContainer}`
                 const toolExchanges = exchangesFromService;
 
                 if (sessionRefreshWarning) {
-                  this.chatHistory = [];
-                  this.addOrUpdateMessageInChat(generateId(), 'model', [{ text: sessionRefreshWarning }], true);
+                  this.isLoading = false;
+                  this.currentAiMessageIdRef = null;
+                  this.mapDisplayData = { places: null, weather: null, route: null };
+                  this.lastSelectedPlace = null;
+                  this.chatHistory = [
+                    {
+                      id: generateId(),
+                      role: 'model',
+                      parts: [{ text: sessionRefreshWarning }],
+                      timestamp: new Date(),
+                    },
+                    {
+                      id: generateId(),
+                      role: 'model',
+                      parts: [{ text: this.getIntroMessageText() }],
+                      timestamp: new Date(),
+                    }
+                  ];
+                  return;
                 }
 
                 let finalAccumulatedText = response.text ?? '';
@@ -1029,7 +1088,7 @@ ${buttonContainer}`
                     contentItem.parts?.forEach((part: Part) => {
                       if (part.functionResponse) {
                         const fr = part.functionResponse as FunctionResponse;
-                        if (fr.name === 'search_places') {
+                        if (fr.name === 'search_places' || fr.name === 'search-places-mcp') {
                           const rawOutput = fr.response as any;
                           const content = rawOutput?.content;
                           let toolOutput: any = null;
@@ -1037,7 +1096,7 @@ ${buttonContainer}`
                             try {
                               toolOutput = JSON.parse(content[0].text);
                             } catch (e) {
-                              console.error("Failed to parse search-places-mcp response:", e);
+                              console.error("Failed to parse search_places response:", e);
                             }
                           }
                           if (toolOutput?.places || toolOutput?.response?.places) {
@@ -1045,7 +1104,7 @@ ${buttonContainer}`
                             const validPlaces = placesFromTool.filter(p => p.id && p.location && typeof p.location.latitude === 'number' && typeof p.location.longitude === 'number');
                             placesThisTurn.push(...validPlaces);
                           }
-                        } else if (fr.name === 'lookup_weather') {
+                        } else if (fr.name === 'lookup_weather' || fr.name === 'lookup-weather') {
                           const rawOutput = fr.response as any;
                           const content = rawOutput?.content;
                           let toolOutput: any = null;
@@ -1053,7 +1112,7 @@ ${buttonContainer}`
                             try {
                               toolOutput = JSON.parse(content[0].text);
                             } catch (e) {
-                              console.error("Failed to parse lookup-weather response:", e);
+                              console.error("Failed to parse lookup_weather response:", e);
                             }
                           }
                           // Remote MCP returns weather data directly (e.g. has 'temperature' or 'weatherCondition')
@@ -1063,7 +1122,7 @@ ${buttonContainer}`
                           } else if (toolOutput?.weather || toolOutput?.response?.weather) {
                             localWeatherData = toolOutput.weather || toolOutput.response.weather;
                           }
-                        } else if (fr.name === 'compute_routes') {
+                        } else if (fr.name === 'compute_routes' || fr.name === 'compute-routes') {
                           const rawOutput = fr.response as any;
                           const content = rawOutput?.content;
                           let toolOutput: any = null;
@@ -1071,14 +1130,22 @@ ${buttonContainer}`
                             try {
                               toolOutput = JSON.parse(content[0].text);
                             } catch (e) {
-                              console.error("Failed to parse compute-routes response:", e);
+                              console.error("Failed to parse compute_routes response:", e);
                             }
                           }
-                          // Remote MCP returns { routes: [...] }
-                          if (toolOutput?.routes && Array.isArray(toolOutput.routes) && toolOutput.routes.length > 0) {
-                            localRouteData = toolOutput.routes[0];
-                          } else if (toolOutput?.route || toolOutput?.response?.route) {
-                            localRouteData = toolOutput.route || toolOutput.response.route;
+                          // Extract route data from either { response: { route } }, { route }, or { routes: [...] },
+                          // preferring the route object that carries distanceMeters and duration.
+                          const candidateRoutes = [
+                            toolOutput?.response?.route,
+                            toolOutput?.route,
+                            ...(Array.isArray(toolOutput?.routes) ? toolOutput.routes : []),
+                            ...(Array.isArray(toolOutput?.response?.routes) ? toolOutput.response.routes : []),
+                          ].filter(Boolean);
+                          if (candidateRoutes.length > 0) {
+                            localRouteData =
+                              candidateRoutes.find(
+                                (r: any) => typeof r.distanceMeters === 'number' || Boolean(r.duration)
+                              ) || candidateRoutes[0];
                           }
                         }
                       }
@@ -1088,8 +1155,7 @@ ${buttonContainer}`
 
                 let specificToolError: string | undefined = undefined;
                 for (const exchange of toolExchanges) {
-                  // Check for error in both wrapped and unwrapped formats
-                  if (exchange.toolName === 'compute-routes' && (exchange.response?.error || exchange.response?.response?.error)) {
+                  if ((exchange.toolName === 'compute-routes' || exchange.toolName === 'compute_routes') && (exchange.response?.error || exchange.response?.response?.error)) {
                     specificToolError = exchange.response.error || exchange.response.response.error;
                     break;
                   }
@@ -1202,7 +1268,7 @@ ${buttonContainer}`
                 this.addOrUpdateMessageInChat(this.currentAiMessageIdRef!, 'model', [{ text: finalAccumulatedText }], true, undefined, localWeatherData ?? undefined, localRouteData ?? undefined, placesThisTurn.length > 0 ? placesThisTurn : undefined, exchangesFromService, sources);
 
               } else if (data.error) {
-                this.addOrUpdateMessageInChat(this.currentAiMessageIdRef!, 'model', [{ text: `**Error:** ${data.error}` }], true, data.error);
+                streamError = data.error;
               }
             } catch (e) {
               console.error("Failed to parse SSE chunk:", e);
@@ -1214,7 +1280,23 @@ ${buttonContainer}`
 
       await processStream();
 
+      if (streamError) {
+        if (retryAttempt < MAX_AUTO_RETRIES) {
+          console.warn(`[Auto-Retry] Stream returned error (${streamError}), retrying automatically (${retryAttempt + 1}/${MAX_AUTO_RETRIES})...`);
+          await new Promise(resolve => setTimeout(resolve, 800 * (retryAttempt + 1)));
+          return await this.processAiResponse(currentUserMessageText, retryAttempt + 1);
+        }
+        this.addOrUpdateMessageInChat(this.currentAiMessageIdRef!, 'model', [{ text: `**Error:** ${streamError}` }], true, streamError);
+        this.isLoading = false;
+        this.currentAiMessageIdRef = null;
+      }
+
     } catch (e) {
+      if (retryAttempt < MAX_AUTO_RETRIES) {
+        console.warn(`[Auto-Retry] Request failed, retrying automatically (${retryAttempt + 1}/${MAX_AUTO_RETRIES})...`, e);
+        await new Promise(resolve => setTimeout(resolve, 800 * (retryAttempt + 1)));
+        return await this.processAiResponse(currentUserMessageText, retryAttempt + 1);
+      }
       const errorMessage = e instanceof Error ? e.message : "An error occurred with the AI.";
       this.addOrUpdateMessageInChat(this.currentAiMessageIdRef!, 'model', [{ text: `**Error:** ${errorMessage}` }], true, errorMessage);
       this.isLoading = false;
@@ -1505,25 +1587,27 @@ ${buttonContainer}`
     const markers = [];
 
     if (routeData.origin?.lat_lng) {
+      const originName = routeData.origin.name || (routeData.origin.place_id ? this.placeNamesCache.get(routeData.origin.place_id) : undefined) || routeData.origin.address || 'Origin';
+      const formattedOriginName = formatPlaceNameForLabel(originName);
       markers.push(html`
         <gmp-marker-3d-interactive
           position=${`${routeData.origin.lat_lng.latitude}, ${routeData.origin.lat_lng.longitude}, 50`}
-          title="Route Origin"
+          title=${`Origin: ${originName}`}
           z-index="1000"
           clickable="true"
           collision-behavior="REQUIRED_AND_HIDES_OPTIONAL"
           draws-when-occluded="true"
           .altitudeMode=${this.AltitudeMode.RELATIVE_TO_MESH}
           extruded="true"
-          label=${truncateLabel(routeData.origin.name ?? (routeData.origin.place_id ? this.placeNamesCache.get(routeData.origin.place_id) : undefined) ?? routeData.origin.address ?? 'Origin')}
+          label=${truncateLabel(formattedOriginName)}
           @gmp-click=${(e: any) => {
-          if (e.preventDefault) e.preventDefault();
-          e.stopPropagation();
-          const placeId = routeData.origin?.place_id;
-          if (placeId) {
-            this.handleMarkerClick(placeId);
-          }
-        }}
+            if (e.preventDefault) e.preventDefault();
+            e.stopPropagation();
+            const placeId = routeData.origin?.place_id;
+            if (placeId) {
+              this.handleMarkerClick(placeId);
+            }
+          }}
           ${onConnected((el: Element) => this.createAndAppendPin(el as HTMLElement, 'A', false, '#00b40fff', '#ccffcc', '#007300ff'))}
         >
         </gmp-marker-3d-interactive>
@@ -1531,26 +1615,28 @@ ${buttonContainer}`
     }
 
     if (routeData.destination?.lat_lng) {
+      const destinationName = routeData.destination.name || (routeData.destination.place_id ? this.placeNamesCache.get(routeData.destination.place_id) : undefined) || routeData.destination.address || 'Destination';
+      const formattedDestinationName = formatPlaceNameForLabel(destinationName);
       trace(`[Route Marker] Destination location found: ${routeData.destination.lat_lng.latitude}, ${routeData.destination.lat_lng.longitude}`);
       markers.push(html`
         <gmp-marker-3d-interactive
           position=${`${routeData.destination.lat_lng.latitude}, ${routeData.destination.lat_lng.longitude}, 50`}
-          title="Route Destination"
+          title=${`Destination: ${destinationName}`}
           z-index="1000"
           clickable="true"
           collision-behavior="REQUIRED_AND_HIDES_OPTIONAL"
           draws-when-occluded="true"
           .altitudeMode=${this.AltitudeMode.RELATIVE_TO_MESH}
           extruded="true"
-          label=${truncateLabel(routeData.destination.name ?? (routeData.destination.place_id ? this.placeNamesCache.get(routeData.destination.place_id) : undefined) ?? routeData.destination.address ?? 'Destination')}
+          label=${truncateLabel(formattedDestinationName)}
           @gmp-click=${(e: any) => {
-          if (e.preventDefault) e.preventDefault();
-          e.stopPropagation();
-          const placeId = routeData.destination?.place_id;
-          if (placeId) {
-            this.handleMarkerClick(placeId);
-          }
-        }}
+            if (e.preventDefault) e.preventDefault();
+            e.stopPropagation();
+            const placeId = routeData.destination?.place_id;
+            if (placeId) {
+              this.handleMarkerClick(placeId);
+            }
+          }}
           ${onConnected((el: Element) => this.createAndAppendPin(el as HTMLElement, 'B', false, '#FF0000', '#FFFFFF', 'white'))}
         >
         </gmp-marker-3d-interactive>
@@ -1660,7 +1746,8 @@ ${buttonContainer}`
         const isSelected = place.id === this.selectedPlaceIdForDetails;
         const indexLabel = String(this.placeIdToIndexMap.get(place.id) ?? index + 1); // Use 1-based index for display
         const cachedName = place.id && this.placeNamesCache.get(place.id);
-        const rawPlaceName = cachedName || place.displayName?.text || place.formattedAddress || place.place || `Place ${indexLabel}`;
+        const displayNameText = typeof place.displayName === 'object' ? place.displayName?.text : (typeof place.displayName === 'string' ? place.displayName : undefined);
+        const rawPlaceName = cachedName || displayNameText || place.formattedAddress || place.place || `Place ${indexLabel}`;
 
         const backgroundColor = isSelected ? '#0069a6' : '#00a2ff';
         const borderColor = isSelected ? '#004f7a' : '#0069a6';
@@ -1713,10 +1800,10 @@ ${buttonContainer}`
       try {
         return JSON.parse(response.content[0].text);
       } catch (_e) {
-        return null;
+        return response;
       }
     }
-    return null;
+    return response || null;
   }
 
   private getPrettyPrintedResponse(response: any): string {
@@ -1760,7 +1847,7 @@ ${buttonContainer}`
   }
 
   private getPrettyPrintedRequest(exchange: ToolExchange): string {
-    if (exchange.toolName === 'search-places-mcp' && exchange.request.query) {
+    if ((exchange.toolName === 'search-places-mcp' || exchange.toolName === 'search_places') && exchange.request.query) {
       // Rename 'query' to 'text_query' for display as requested
       const displayRequest = { ...exchange.request, text_query: exchange.request.query };
       delete displayRequest.query;
@@ -1781,8 +1868,8 @@ ${buttonContainer}`
     if (lastMessage && lastMessage.toolExchanges) {
       const toolNames = new Set(lastMessage.toolExchanges.map(tx => tx.toolName));
 
-      const isWeatherToolUsed = toolNames.has('lookup-weather');
-      const isPlacesOrRoutesToolUsed = toolNames.has('search-places-mcp') || toolNames.has('compute-routes');
+      const isWeatherToolUsed = toolNames.has('lookup-weather') || toolNames.has('lookup_weather');
+      const isPlacesOrRoutesToolUsed = toolNames.has('search-places-mcp') || toolNames.has('search_places') || toolNames.has('compute-routes') || toolNames.has('compute_routes');
 
       // Hide the weather marker if it's a multi-tool response (Places/Routes + Weather)
       if (isWeatherToolUsed && isPlacesOrRoutesToolUsed) {
@@ -1798,8 +1885,8 @@ ${buttonContainer}`
     if (lastMessage && lastMessage.toolExchanges) {
       const toolNames = new Set(lastMessage.toolExchanges.map(tx => tx.toolName));
 
-      const isPlacesToolUsed = toolNames.has('search-places-mcp');
-      const isRoutesToolUsed = toolNames.has('compute-routes');
+      const isPlacesToolUsed = toolNames.has('search-places-mcp') || toolNames.has('search_places');
+      const isRoutesToolUsed = toolNames.has('compute-routes') || toolNames.has('compute_routes');
 
       // Make places optional if both routes and places tools were used
       if (isPlacesToolUsed && isRoutesToolUsed) {
@@ -1826,6 +1913,62 @@ ${buttonContainer}`
     );
   }
 
+  private syncPlaceDetailsWidget(container: HTMLElement, placeResourceName: string) {
+    container.dataset.placeResource = placeResourceName;
+
+    // Wait until Maps JS registers <gmp-place-details-compact> so its constructor
+    // executes before any child elements (<gmp-place-all-content>) are attached.
+    if (!customElements.get('gmp-place-details-compact')) {
+      if (!container.dataset.waitingForUpgrade) {
+        container.dataset.waitingForUpgrade = 'true';
+        customElements.whenDefined('gmp-place-details-compact').then(() => {
+          delete container.dataset.waitingForUpgrade;
+          const targetPlace = container.dataset.placeResource;
+          if (container.isConnected && targetPlace) {
+            this.syncPlaceDetailsWidget(container, targetPlace);
+          }
+        });
+      }
+      return;
+    }
+
+    const existingCompact = container.querySelector('gmp-place-details-compact') as HTMLElement | null;
+    if (container.dataset.mountedPlace === placeResourceName && existingCompact) {
+      return;
+    }
+
+    container.dataset.selectedAt = String(Date.now());
+    let requestEl = existingCompact?.querySelector('gmp-place-details-place-request') as any;
+
+    if (!existingCompact || !requestEl) {
+      container.replaceChildren();
+      const compact = document.createElement('gmp-place-details-compact');
+      compact.setAttribute('orientation', 'horizontal');
+
+      requestEl = document.createElement('gmp-place-details-place-request') as any;
+      requestEl.place = placeResourceName;
+
+      const allContent = document.createElement('gmp-place-all-content');
+      compact.append(requestEl, allContent);
+      container.appendChild(compact);
+
+      let lastHeight = 0;
+      const resizeObserver = new ResizeObserver((entries) => {
+        const height = entries[0]?.contentRect.height ?? 0;
+        if (height > lastHeight && Date.now() - Number(container.dataset.selectedAt || 0) < 3000) {
+          this.scrollToBottom();
+        }
+        lastHeight = height;
+      });
+      resizeObserver.observe(compact);
+    } else {
+      requestEl.place = placeResourceName;
+    }
+
+    container.dataset.mountedPlace = placeResourceName;
+    this.scrollToBottom();
+  }
+
   private renderPlaceDetailsWidget() {
     if (!this.selectedPlaceIdForDetails) {
       return '';
@@ -1833,15 +1976,17 @@ ${buttonContainer}`
 
     const placeResourceName = `places/${this.selectedPlaceIdForDetails}`;
 
-    // Render as a model message at the end of the chat container
+    // Render as a model message at the end of the chat container.
+    // Note: <gmp-place-details-compact> is mounted imperatively via syncPlaceDetailsWidget
+    // because cloning <gmp-place-details-compact><gmp-place-all-content> from a Lit <template>
+    // upgrades PlaceDetailsCompactElement with <gmp-place-all-content> already attached before
+    // its preset dictionary is initialized after super() in Maps JS weekly.
     return html`
-        <div class="flex justify-start pointer-events-auto">
-            <div class="max-w-full sm:max-w-[90%] w-full p-3 shadow bg-[#FFFFFF] text-[#1A1C1E] rounded-t-2xl rounded-r-2xl rounded-bl-lg">
-                <gmp-place-details-compact orientation="horizontal">
-                  <gmp-place-details-place-request place=${placeResourceName}></gmp-place-details-place-request>
-                  <gmp-place-all-content></gmp-place-all-content>
-                </gmp-place-details-compact>
-            </div>
+        <div class="flex justify-start pointer-events-auto flex-shrink-0">
+            <div
+              class="max-w-full sm:max-w-[90%] w-full p-3 shadow bg-[#FFFFFF] text-[#1A1C1E] rounded-t-2xl rounded-r-2xl rounded-bl-lg"
+              ${onConnected((el: Element) => this.syncPlaceDetailsWidget(el as HTMLElement, placeResourceName))}
+            ></div>
         </div>
     `;
   }
@@ -1882,6 +2027,7 @@ ${buttonContainer}`
               heading=${this.mapHeading}
               range=${this.mapRange}
               map-id="749ac551edae0fb44cf73ee1"
+              internal-usage-attribution-ids="gmp_devsite_groundinglitesampleapp_v1.0.0"
               class="absolute inset-0 w-full h-full"
               aria-label="3D Map of found locations"
               @gmp-click=${this.handleMapClick}
@@ -1994,7 +2140,7 @@ ${buttonContainer}`
             <div class="px-4 sm:p-6 flex-shrink-0 pointer-events-auto pb-safe">
               <div class="overflow-x-auto px-4 -mx-4 sm:p-0 sm:m-0 sm:flex sm:flex-col sm:gap-1 quick-answers-mobile-layout">
                 <div class="flex gap-1 w-max sm:w-full sm:block py-0.5 sm:py-0">
-                ${(this.chatHistory.length <= 1 ? this.quickAnswers : this.getDynamicQuickAnswers()).map(answer => html`
+                ${(this.chatHistory.length <= 1 || (this.chatHistory.length <= 3 && this.chatHistory[0]?.parts[0]?.text?.includes('Session Refreshed')) ? this.quickAnswers : this.getDynamicQuickAnswers()).map(answer => html`
                   <button
                     @click=${() => this.handleQuickAnswerClick(answer)}
                     @mouseover=${this.handleQuickAnswerMouseOver}
@@ -2086,22 +2232,27 @@ ${buttonContainer}`
     const urls = new Set<string>();
 
     for (const exchange of toolExchanges) {
-      const toolOutput = this._getParsedToolOutput(exchange.response);
+      const toolOutput = this._getParsedToolOutput(exchange.response) || exchange.response;
 
       // Check for both wrapped and unwrapped places
-      if (exchange.toolName === 'search_places' && !exchange.isFailure && (toolOutput?.places || toolOutput?.response?.places)) {
+      if ((exchange.toolName === 'search_places' || exchange.toolName === 'search-places-mcp') && !exchange.isFailure && (toolOutput?.places || toolOutput?.response?.places)) {
         const places = toolOutput.places || toolOutput.response.places;
         if (Array.isArray(places)) {
           for (const place of places) {
-            // Note: Grounding Lite Place objects use googleMapsLinks.placeUri or placeUrl (using placeUrl here)
-            if (place.googleMapsLinks && (place.googleMapsLinks.placeUrl || place.googleMapsLinks.placeUri)) {
-              urls.add(place.googleMapsLinks.placeUrl || place.googleMapsLinks.placeUri);
+            const placeUrl = place.googleMapsUri ||
+              place.googleMapsLinks?.placeUrl ||
+              place.googleMapsLinks?.placeUri ||
+              place.placeUri ||
+              place.placeUrl ||
+              (place.id ? `https://www.google.com/maps/place/?q=place_id:${place.id}` : undefined);
+            if (placeUrl) {
+              urls.add(placeUrl);
             }
           }
         }
-      } else if (exchange.toolName === 'lookup-weather' && !exchange.isFailure) {
+      } else if ((exchange.toolName === 'lookup-weather' || exchange.toolName === 'lookup_weather') && !exchange.isFailure) {
         // Per user request, do not add generic Google Maps URL for weather results.
-      } else if (exchange.toolName === 'compute-routes' && !exchange.isFailure) {
+      } else if ((exchange.toolName === 'compute-routes' || exchange.toolName === 'compute_routes') && !exchange.isFailure) {
         // Per user request, do not add generic Google Maps URL for route results.
       }
     }

@@ -16,7 +16,7 @@
 
 /** Global logging utility that can be centrally disabled. */
 
-let isTracingEnabled = false;
+let isTracingEnabled = true;
 
 /**
  * Centrally enable or disable logging/tracing.

@@ -14,13 +14,13 @@
  * limitations under the License.
  */
 
-import { trace } from './utils/logger.ts';
+import { trace } from './utils/logger.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { z } from 'zod';
-import { searchPlacesReal, lookupWeather, computeRoutes } from './services/groundingLiteService.ts';
-import { getPlaceDetailsReal as _getPlaceDetailsReal, getElevationForLocations } from './services/complementaryServices.ts';
-import { Place, WeatherData, GoogleDate, RouteData, TravelMode, FailedToolResponse, LatLng } from './types.ts';
+import { searchPlacesReal, lookupWeather, computeRoutes } from './services/groundingLiteService.js';
+import { getPlaceDetailsReal as _getPlaceDetailsReal, getElevationForLocations } from './services/complementaryServices.js';
+import { Place, WeatherData, GoogleDate, RouteData, TravelMode, FailedToolResponse, LatLng } from './types.js';
 import axios from 'axios';
 
 async function fetchTools() {
@@ -165,9 +165,7 @@ export async function startMcpServer(transport: Transport): Promise<void> {
               trace(`[MCP Server] Success from computeRoutes.`);
               const responseData: RouteData = {
                 ...toolResult.data,
-                origin: origin,
-                destination: destination,
-                travelMode: travelMode || 'DRIVE' // Default to DRIVE if undefined
+                travelMode: toolResult.data.travelMode || travelMode || 'DRIVE' // Default to DRIVE if undefined
               };
               responsePayload = { route: responseData };
           } else {

@@ -14,10 +14,12 @@
  * limitations under the License.
  */
 
-export const cleanPlaceName = (displayName: { text: string } | undefined): string => {
-  if (!displayName?.text) return 'Place';
+export const cleanPlaceName = (displayName: { text?: string } | string | undefined): string => {
+  if (!displayName) return '';
+  const text = typeof displayName === 'string' ? displayName : displayName.text;
+  if (!text) return '';
   // Remove common suffixes like " (The)" or " (A)" and trim whitespace
-  return displayName.text.replace(/\s+\(The\)$/i, '').replace(/\s+\(A\)$/i, '').trim();
+  return text.replace(/\s+\(The\)$/i, '').replace(/\s+\(A\)$/i, '').trim();
 };
 
 export const formatPlaceNameForLabel = (name: string): string => {

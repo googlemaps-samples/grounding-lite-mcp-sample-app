@@ -47,7 +47,10 @@ fi
 
 # Read the required keys
 SERVER_API_KEY=$(get_env_key "SERVER_API_KEY")
-MAPS_API_KEY=$(get_env_key "MAPS_API_KEY")
+GOOGLE_MAPS_API_KEY=$(get_env_key "GOOGLE_MAPS_API_KEY")
+if [ -z "$GOOGLE_MAPS_API_KEY" ]; then
+    GOOGLE_MAPS_API_KEY=$(get_env_key "MAPS_API_KEY")
+fi
 
 # Validate that keys were successfully read
 if [ -z "$SERVER_API_KEY" ]; then
@@ -55,8 +58,8 @@ if [ -z "$SERVER_API_KEY" ]; then
     exit 1
 fi
 
-if [ -z "$MAPS_API_KEY" ]; then
-    echo "Error: MAPS_API_KEY is missing or empty in $ENV_FILE"
+if [ -z "$GOOGLE_MAPS_API_KEY" ]; then
+    echo "Error: GOOGLE_MAPS_API_KEY is missing or empty in $ENV_FILE"
     exit 1
 fi
 
@@ -70,7 +73,7 @@ gcloud run deploy grounding-lite-app \
     --region "$GCP_REGION" \
     --platform managed \
     --allow-unauthenticated \
-    --set-env-vars SERVER_API_KEY="$SERVER_API_KEY",MAPS_API_KEY="$MAPS_API_KEY" \
+    --set-env-vars SERVER_API_KEY="$SERVER_API_KEY",GOOGLE_MAPS_API_KEY="$GOOGLE_MAPS_API_KEY" \
     --project "$GCP_PROJECT_ID"
 
 echo "Deployment command completed."

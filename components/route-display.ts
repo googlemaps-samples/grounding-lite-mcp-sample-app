@@ -20,10 +20,10 @@ import { RouteData } from '../types';
 
 const formatDuration = (durationString: string): string => {
   if (!durationString) {
-    return '';
+    return '—';
   }
-  const seconds = parseInt(durationString.replace('s', ''), 10);
-  if (isNaN(seconds)) return '';
+  const seconds = parseInt(String(durationString).replace('s', ''), 10);
+  if (isNaN(seconds)) return '—';
 
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
@@ -46,6 +46,9 @@ const formatDuration = (durationString: string): string => {
 };
 
 const formatDistance = (meters: number): string => {
+  if (typeof meters !== 'number' || isNaN(meters)) {
+    return '—';
+  }
   // Using Imperial units for this example
   const miles = meters / 1609.34;
   if (miles >= 0.1) {

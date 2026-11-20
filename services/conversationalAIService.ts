@@ -31,6 +31,8 @@ import {
 import { ToolExchange } from '../types.js';
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"; // Corrected path based on feedback
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { startMcpServer } from '../mcpServer.js';
 import { callRoutesApiV2 } from './complementaryServices.js';
 
 
@@ -41,21 +43,131 @@ const MAX_INACTIVITY_MS = 30 * 60 * 1000; // User requested 30 minutes
 let chat: Chat | null = null;
 let turnCount = 0;
 let lastInteractionTimestamp = 0;
-const MODEL_NAME = 'gemini-2.5-flash-preview-09-2025'; //'gemini-3-flash-preview-09-2025';//'gemini-2.5-flash-preview-09-2025';//gemini-3-flash';// '
+const MODEL_NAME = process.env.GEMINI_MODEL || 'gemini-flash-latest';
+
+// Multi-model failover & retry chain to mitigate transient 503 UNAVAILABLE demand spikes
+const GEMINI_FAILOVER_CHAIN: Array<{
+  model: string;
+  thinkingBudget: number;
+  timeoutMs: number;
+  delayBeforeMs: number;
+}> = [
+  { model: MODEL_NAME, thinkingBudget: 256, timeoutMs: 18000, delayBeforeMs: 0 },
+  { model: MODEL_NAME, thinkingBudget: 0, timeoutMs: 15000, delayBeforeMs: 500 },
+  { model: 'gemini-3-flash-preview', thinkingBudget: 0, timeoutMs: 15000, delayBeforeMs: 300 },
+  { model: 'gemini-3.6-flash', thinkingBudget: 0, timeoutMs: 15000, delayBeforeMs: 300 },
+  { model: 'gemini-3.5-flash', thinkingBudget: 0, timeoutMs: 15000, delayBeforeMs: 300 },
+  { model: 'gemini-3.1-flash-lite', thinkingBudget: 0, timeoutMs: 14000, delayBeforeMs: 300 },
+];
 
 let ai: GoogleGenAI | null = null;
 export let mcpClientInstance: McpClient | null = null;
+let localMcpClientInstance: McpClient | null = null;
 
 // Module-level status handler for MCP tool interception
 let currentStatusHandler: ((status: string) => void) | null = null;
+
+const isRetryableGeminiError = (error: any): boolean => {
+  const status = error?.status ?? error?.code ?? error?.error?.code;
+  const msg = String(error?.message || '');
+  return (
+    status === 503 ||
+    status === 429 ||
+    status === 500 ||
+    status === 502 ||
+    status === 504 ||
+    status === 404 ||
+    msg.includes('503') ||
+    msg.includes('UNAVAILABLE') ||
+    msg.includes('high demand') ||
+    msg.includes('Spikes in demand') ||
+    msg.includes('overloaded') ||
+    msg.includes('RESOURCE_EXHAUSTED') ||
+    msg.includes('timed out') ||
+    msg.includes('AbortError') ||
+    msg.includes('fetch failed') ||
+    msg.includes('ECONNRESET')
+  );
+};
+
+/**
+ * Wraps the GoogleGenAI SDK's internal `generateContentInternal` method so that
+ * every individual Gemini HTTP call (including both pre-tool and post-tool hops
+ * inside Automatic Function Calling) automatically retries with backoff and
+ * fails over across backup Flash models when 503 demand spikes occur.
+ */
+const installResilientGenerateContent = (client: GoogleGenAI): void => {
+  const modelsAny = client.models as any;
+  if (!modelsAny || modelsAny.__resilientWrapperInstalled) return;
+
+  const originalGenerateContentInternal = modelsAny.generateContentInternal.bind(modelsAny);
+
+  modelsAny.generateContentInternal = async (params: any) => {
+    let lastError: any = null;
+
+    for (let i = 0; i < GEMINI_FAILOVER_CHAIN.length; i++) {
+      const attempt = GEMINI_FAILOVER_CHAIN[i];
+      const activeModel = i === 0 && params?.model ? params.model : attempt.model;
+
+      if (attempt.delayBeforeMs > 0) {
+        const jitter = Math.floor(Math.random() * 250);
+        await new Promise(resolve => setTimeout(resolve, attempt.delayBeforeMs + jitter));
+      }
+
+      const abortController = new AbortController();
+      const timeoutId = setTimeout(() => abortController.abort(), attempt.timeoutMs);
+
+      const attemptParams = {
+        ...params,
+        model: activeModel,
+        config: {
+          ...(params?.config || {}),
+          abortSignal: abortController.signal,
+          thinkingConfig: {
+            ...(params?.config?.thinkingConfig || {}),
+            thinkingBudget: attempt.thinkingBudget,
+          },
+        },
+      };
+
+      try {
+        const response = await originalGenerateContentInternal(attemptParams);
+        clearTimeout(timeoutId);
+        if (i > 0) {
+          trace(`[Gemini Spike Mitigation] Attempt ${i + 1} (${activeModel}) succeeded after failover.`);
+        }
+        return response;
+      } catch (error: any) {
+        clearTimeout(timeoutId);
+        lastError = error;
+
+        if (!isRetryableGeminiError(error) || i === GEMINI_FAILOVER_CHAIN.length - 1) {
+          throw error;
+        }
+
+        const nextModel = GEMINI_FAILOVER_CHAIN[i + 1].model;
+        console.warn(
+          `[Gemini Spike Mitigation] Attempt ${i + 1}/${GEMINI_FAILOVER_CHAIN.length} (${activeModel}) hit transient spike (${error?.status || error?.message}). Failing over to ${nextModel}...`
+        );
+        if (currentStatusHandler) {
+          currentStatusHandler(`High demand on primary model, switching to backup...\nPlease wait.`);
+        }
+      }
+    }
+
+    throw lastError || new Error('Gemini API request failed after all failover attempts.');
+  };
+
+  modelsAny.__resilientWrapperInstalled = true;
+};
 
 // Base System Instruction
 const baseSystemInstruction = `You are a friendly, expert conversational assistant named 'Grounding Lite API'.
 Your primary goal is to help users discover and learn about places, and get relevant real-time information like weather and directions.
 You have three tools available:
 1. 'search_places': Searches for real-world places (e.g., restaurants, attractions). It returns place details and a pre-written summary.
-2. 'lookup-weather': Fetches the current, forecasted, or historical weather conditions for a specific location. It accepts an optional 'date' (as an object with year, month, and day) and 'hour' (0-23) for specific times.
-3. 'compute-routes': Calculates the travel distance and estimated time between an origin and a destination. It accepts an optional 'travelMode' parameter ('DRIVE', 'WALK', or 'TWO_WHEELER'). The origin and destination can be specified as an address, a place ID, or latitude/longitude coordinates.
+2. 'lookup_weather': Fetches the current, forecasted, or historical weather conditions for a specific location. It accepts an optional 'date' (as an object with year, month, and day) and 'hour' (0-23) for specific times.
+3. 'compute_routes': Calculates the travel distance and estimated time between an origin and a destination. It accepts an optional 'travelMode' parameter ('DRIVE', 'WALK', or 'TWO_WHEELER'). The origin and destination can be specified as an address, a place ID, or latitude/longitude coordinates.
 
 **How to use your tools:**
 
@@ -75,7 +187,7 @@ You have three tools available:
   - **Example 1: Weather + Places (Simple Sequence):**
     - User: "What's the weather in Los Angeles and find me some ramen places there."
     - Step 1: You call \`search_places\` for "Los Angeles". It returns one place. This is place \`[0]\` in the unified list.
-    - Step 2: You call \`lookup-weather\`.
+    - Step 2: You call \`lookup_weather\`.
     - Step 3: You call \`search_places\` for "ramen places in Los Angeles". It returns "Daikokuya" and "Tsujita". These are places \`[1]\` and \`[2]\` in the unified list.
     - Your final response MUST use these indices: "The weather in Los Angeles [0] is sunny. For ramen, you could try Daikokuya [1] or Tsujita [2]."
     - **Incorrect:** "...Daikokuya [0]..." (Wrong, \`[0]\` is Los Angeles).
@@ -96,6 +208,13 @@ You have three tools available:
     - Your final response MUST use the correct indices from the full unified list, skipping the numbers for the places you didn't mention: "For museums, a great option is The Louvre [0]. For cafes, you might like Café de Flore [2] or the Shakespeare and Company Café [4]."
     - **Incorrect:** "For museums, a great option is The Louvre [0]. For cafes, you might like Café de Flore [1] or the Shakespeare and Company Café [2]." This is wrong because it re-numbers the cafes, ignoring that Musée d'Orsay was \`[1]\` and Les Deux Magots was \`[3]\` in the complete list of results you received.
 
+- **Conversational Context & Follow-up Queries (CRITICAL):**
+  - You MUST maintain and actively use conversational context across turns.
+  - When the user asks a follow-up question referencing places, routes, origins, or destinations from previous turns in the conversation (such as "What is the weather at the destination?", "What is the weather at the origin?", "Find hotels near the destination", "Find restaurants near here", "Show me the route there", "What about tomorrow?"):
+    - You MUST resolve the target location (origin, destination, or place) from the conversation history.
+    - DO NOT ask the user to clarify or re-specify which destination, origin, or place they mean if it was already established in previous turns (e.g., if a previous turn computed a route from Los Angeles to San Diego, "the destination" is San Diego).
+    - Immediately invoke the appropriate tool (\`lookup_weather\`, \`search_places\`, or \`compute_routes\`) using the resolved location (name, address, or place ID) without asking unnecessary clarifying questions.
+
 - **For Follow-up Questions about a Place:**
   - If the user asks a follow-up question about a specific place previously mentioned (e.g., "what is the phone number for [0]?", "how are the reviews for The Grind [1]?", "is it open now?"), and the query is NOT about weather, you MUST use the 'search_places' tool again to find these specific details.
   - **CRITICAL:** To get accurate details, you MUST rewrite the search query to be very specific. Include the name of the place and its general location (city/area) from the conversation context.
@@ -103,30 +222,27 @@ You have three tools available:
   - **Example of a good rewritten query:** If the user asks "what's the phone number for [0]?" and you know "[0]" is "The Nook Cafe" in "Sydney", your tool call query should be something like "phone number for The Nook Cafe in Sydney". This will help the tool find the exact place and retrieve the correct information. The tool can often find details like phone numbers, ratings, or opening hours if you ask for them in the query.
 
 - **Location Disambiguation:**
-  - If a user mentions a location name that is potentially ambiguous (e.g., "Paris, Texas" vs. "Paris, France"; "Los Altos"), you MUST ask clarifying questions to confirm the correct location before using any tool. If the user has already selected a place (indicated by a 'placeId' in the prompt), you MUST use that place as the context for the query.
-  - **Example interaction:**
-    - User: "Find me some good restaurants in Los Altos."
-    - You: "Of course! Could you please clarify which Los Altos you mean? For example, the one in California, USA?"
-  - After the user confirms, you MUST use the specific, unambiguous location in your subsequent tool calls (e.g., 'query: "good restaurants in Los Altos, California"'). This is critical for getting accurate results.
+  - If a user mentions a completely new location name that is truly ambiguous (e.g., "Paris, Texas" vs. "Paris, France"; "Los Altos" with no prior context), you may ask clarifying questions. However, if the location is clear from prior conversation context or selected placeId, use it directly without asking.
+  - If the user has already selected a place (indicated by a 'placeId' in the prompt), you MUST use that place as the context for the query.
 
-- **For Weather Information:** When a user asks about the weather for a location (e.g., 'weather in Paris', 'what is the temperature in Tokyo'), you MUST use the 'lookup-weather' tool.
-  - **CRITICAL - DIRECT CALL:** The 'lookup-weather' tool now accepts a location object which can contain EITHER 'address' (string), 'placeId' (string), OR 'latLng' (object).
+- **For Weather Information:** When a user asks about the weather for a location (e.g., 'weather in Paris', 'what is the temperature in Tokyo', 'weather at the destination'), you MUST use the 'lookup_weather' tool.
+  - **CRITICAL - DIRECT CALL:** The 'lookup_weather' tool accepts a location object which can contain EITHER 'address' (string), 'placeId' (string), OR 'latLng' (object).
   - If the user provides an address (e.g., "New York"), you MUST provide it as the 'location' parameter with the 'address' field set. Example: "{'location': {'address': 'New York'}}". There is NO NEED to call 'search_places' first for geocoding.
-  - If the location is known from a previous 'search_places' result (e.g., index [0]), you MUST use the precise 'placeId' or 'latLng' from that result when calling 'lookup-weather'.
-  - For future or past weather, provide the location object along with the 'date' and optionally the 'hour' in the 'lookup-weather' call.
+  - If the location is known from a previous 'search_places' result (e.g., index [0]) or route, you MUST use the precise 'placeId', 'address', or 'latLng' from that result when calling 'lookup_weather'.
+  - For future or past weather, provide the location object along with the 'date' and optionally the 'hour' in the 'lookup_weather' call.
 
-- **For Route Information:** When a user asks about the distance, travel time, or navigation between two points (e.g., "how far is it from SF to LA?", "how long to walk from [0] to [1]?", "go from A to B"), you MUST use the 'compute-routes' tool.
+- **For Route Information:** When a user asks about the distance, travel time, driving route, or navigation between two points (e.g., "what is the driving route from Los Angeles to San Diego?", "how far is it from SF to LA?", "how long to walk from [0] to [1]?", "go from A to B"), you MUST NOT answer from memory or general knowledge. You MUST ALWAYS call the 'compute_routes' tool FIRST.
   - The tool accepts an optional 'travelMode' parameter. Supported values are 'DRIVE' (the default), 'WALK', and 'TWO_WHEELER' (for motorcycles/scooters). You MUST infer the travel mode from the user's query. For example, a query about "walking time" should use 'WALK', "biking" or "motorcycle" could use 'TWO_WHEELER'. If no mode is specified, the tool defaults to 'DRIVE'.
-  - You can use addresses, or if you have found places with 'search_places', you can use their 'place_id' in the 'origin' or 'destination' parameters for the 'compute-routes' tool. This is very useful for follow-up questions.
+  - You can use addresses, or if you have found places with 'search_places', you can use their 'place_id' in the 'origin' or 'destination' parameters for the 'compute_routes' tool. This is very useful for follow-up questions.
   - When you get a result, present the distance and duration to the user in a clear, human-readable format. For example, convert meters to miles or kilometers, and the duration string (e.g., "3600s") into hours and minutes.
 
 - **For Combined Queries:** For complex queries that require multiple pieces of information (e.g., route, weather, places), you MUST execute ALL necessary tool calls sequentially before generating a response. DO NOT skip any required tool calls.
   - **ABSOLUTE CRITICAL SEQUENCE: Route + Weather Queries:** If the user asks for both a route and weather (e.g., "route from A to B and weather at B"), you MUST execute the following 3-step sequence, without exception:
     1. Call 'search_places' for the destination (B) to get coordinates/place ID and ensure the place is indexed [0].
-    2. Call 'compute-routes' using the origin (A) and destination (B).
-    3. Call 'lookup-weather' for the destination (B) using the location found in step 1.
+    2. Call 'compute_routes' using the origin (A) and destination (B).
+    3. Call 'lookup_weather' for the destination (B) using the location found in step 1.
     4. Only then, generate the final response combining all results.
-  - For other combined queries (e.g., place + weather), a good strategy is to first call 'lookup-weather' to understand the conditions, and then use that information to make a more specific and relevant call to 'search_places'. For example, if the weather is sunny, search for "parks" or "outdoor seating"; if it's rainy, search for "museums" or "indoor activities". For route queries, you can chain 'search_places' to find locations and then use their 'place_id's in a call to 'compute-routes'.
+  - For other combined queries (e.g., place + weather), a good strategy is to first call 'lookup_weather' to understand the conditions, and then use that information to make a more specific and relevant call to 'search_places'. For example, if the weather is sunny, search for "parks" or "outdoor seating"; if it's rainy, search for "museums" or "indoor activities". For route queries, you can chain 'search_places' to find locations and then use their 'place_id's in a call to 'compute_routes'.
 
 - **General Rules:**
   - Always prefer using a tool over your general knowledge for real-time, location-specific information.
@@ -174,57 +290,86 @@ export const initChatSession = async (initialHistory?: Content[]): Promise<{ suc
       console.log("[initChatSession] Initializing GoogleGenAI client...");
       ai = new GoogleGenAI({ apiKey: serverApiKey });
     }
+    installResilientGenerateContent(ai);
   } catch (e) {
     console.error("[initChatSession] Failed to initialize GoogleGenAI client:", e);
     return { success: false, modelName: MODEL_NAME };
   }
 
-  // Reuse MCP client if already initialized, but ALWAYS reset the chat session.
-  if (mcpClientInstance) {
-    trace("MCP client already initialized. Reusing connection.");
-  } else {
-    try {
-      console.log("[initChatSession] Starting MCP setup...");
-      // 1. Setup REMOTE MCP Client with StreamableHTTPClientTransport (for internal use by services)
-      const remoteClient = new McpClient({ name: "GroundingLiteAppRemoteMcpClient", version: "1.0.0" });
-      await remoteClient.connect(new StreamableHTTPClientTransport(
-        new URL(MCP_URL),
-        {
-          requestInit: {
-            headers: {
-              "X-Goog-Api-Key": serverApiKey,
-            },
-            redirect: 'follow'
-          }
-        }
-      ));
-      mcpClientInstance = remoteClient; // This is the remote client for services
-      trace("REMOTE MCP Client connected successfully.");
-    } catch (error) {
-      console.error("Error initializing MCP client:", error);
-      mcpClientInstance = null;
-      return { success: false, modelName: MODEL_NAME };
-    }
+  if (mcpClientInstance && localMcpClientInstance && ai) { // Re-initialize chat session and reset turnCount on page reload while reusing existing MCP connection
+    trace("MCP clients already initialized. Recreating Gemini chat session and resetting turn counter.");
+    const toolsForGemini = [mcpToTool(localMcpClientInstance)];
+    const dynamicSystemInstruction = getSystemInstruction();
+    chat = ai.chats.create({
+      model: MODEL_NAME,
+      history: initialHistory || [],
+      config: {
+        temperature: 0.6,
+        thinkingConfig: {
+          thinkingBudget: 512
+        },
+        systemInstruction: dynamicSystemInstruction,
+        tools: toolsForGemini.length > 0 ? toolsForGemini : undefined,
+        safetySettings: [
+          { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+          { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE },
+          { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE },
+          { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE },
+        ],
+      }
+    });
+    turnCount = 0;
+    lastInteractionTimestamp = Date.now();
+    return { success: true, modelName: MODEL_NAME };
   }
 
   try {
-    // 2. Use the REMOTE MCP Client for Gemini tools directly
-    // This bypasses the local MCP server wrapper and connects Gemini directly to the Google Maps MCP server.
-    let toolsForGemini = [mcpToTool(mcpClientInstance)];
+    console.log("[initChatSession] Starting MCP setup...");
+    // 1. Setup REMOTE MCP Client with StreamableHTTPClientTransport (for internal use by services)
+    const remoteClient = new McpClient({ name: "GroundingLiteAppRemoteMcpClient", version: "1.0.0" });
+    await remoteClient.connect(new StreamableHTTPClientTransport(
+      new URL(MCP_URL),
+      {
+        requestInit: {
+          headers: {
+            "X-Goog-Api-Key": serverApiKey,
+          },
+          redirect: 'follow'
+        }
+      }
+    ));
+    mcpClientInstance = remoteClient; // This is the remote client for services
+    trace("REMOTE MCP Client connected successfully.");
 
-    // Wrap the tool execution to update status
-    if (toolsForGemini.length > 0) {
-        // We can't easily wrap the execution here because mcpToTool returns a Tool object, 
-        // and the execution logic is internal to the SDK or the McpClient.
-        // However, we can wrap the McpClient's callTool method!
-      const originalCallTool = mcpClientInstance.callTool.bind(mcpClientInstance);
-      mcpClientInstance.callTool = async (params: any, resultSchema?: any) => {
-            if (currentStatusHandler) {
-              currentStatusHandler(`Calling <b>${params.name}</b>...\nPlease wait.`);
-            }
-            return originalCallTool(params, resultSchema);
-        };
-    }
+    // 2. Create InMemoryTransport pair for local client-server communication
+    const [transportA, transportB] = InMemoryTransport.createLinkedPair();
+
+    // 3. Start LOCAL MCP Server with one end of the transport (this server uses our wrappers)
+    startMcpServer(transportA).catch((err: any) => {
+      console.error("Critical error: LOCAL MCP Server failed to start or crashed:", err);
+    });
+
+    // 4. Setup LOCAL MCP Client with the other end
+    const localClient = new McpClient({ name: "GroundingLiteAppLocalMcpClient", version: "1.0.0" });
+    await localClient.connect(transportB);
+    localMcpClientInstance = localClient;
+    trace("LOCAL MCP Client connected successfully.");
+
+    // Wrap the local client's callTool method to emit status updates
+    const originalCallTool = localClient.callTool.bind(localClient);
+    localClient.callTool = async (params, ...args) => {
+        if (currentStatusHandler) {
+            currentStatusHandler(`Calling tool: <b>${params.name}</b>...\nWaiting for result.`);
+        }
+        const result = await originalCallTool(params, ...args);
+        if (currentStatusHandler) {
+            currentStatusHandler(`Tool  <b> ${params.name}</b> finished.\nProcessing result...`);
+        }
+        return result;
+    };
+
+    // 5. Get tools from the LOCAL MCP client for Gemini
+    const toolsForGemini = [mcpToTool(localClient)];
 
     if (toolsForGemini.length === 0) {
         console.warn("MCP client reported no tools (remoteTools map is empty or client not initialized), or mcpToTool conversion resulted in no tools. Place search functionality might be unavailable to Gemini.");
@@ -262,6 +407,8 @@ export const initChatSession = async (initialHistory?: Content[]): Promise<{ suc
     return { success: true, modelName: MODEL_NAME };
   } catch (error) {
     console.error("Error initializing chat session with MCP integration:", error);
+    mcpClientInstance = null; // Reset on error
+    localMcpClientInstance = null;
     chat = null;
     return { success: false, modelName: MODEL_NAME };
   } finally {
@@ -337,6 +484,7 @@ export const sendMessageToAI = async (
   const shouldRefresh = !chat || turnCount >= MAX_TURNS || timeElapsed >= MAX_INACTIVITY_MS;
 
   if (shouldRefresh) {
+    const isTimeoutOrLimit = !!chat && (turnCount >= MAX_TURNS || timeElapsed >= MAX_INACTIVITY_MS);
     let reason = "";
     if (!chat) reason = "The chat session was not initialized.";
     else if (turnCount >= MAX_TURNS) reason = `The conversation reached the maximum limit of ${MAX_TURNS} prompts.`;
@@ -349,6 +497,18 @@ export const sendMessageToAI = async (
     if (!initialized || !chat) {
        console.error("Chat session not initialized and re-initialization failed.");
        throw new Error("Chat session is not available.");
+    }
+
+    if (isTimeoutOrLimit) {
+      const dummyResponse: GenerateContentResponse = {
+        candidates: [],
+        text: "",
+        functionCalls: () => [],
+      } as unknown as GenerateContentResponse;
+      if (onStatusUpdate) {
+        onStatusUpdate("Ready.");
+      }
+      return { response: dummyResponse, turnContent: [], toolExchanges: [], sessionRefreshWarning };
     }
   }
    if (!ai) { // Should be caught by initChatSession, but good to double check
@@ -408,7 +568,13 @@ export const sendMessageToAI = async (
     // After the call, the chat's history is updated with the full turn.
     const historyAfter = await chat!.getHistory();
     // We extract the parts that were just added.
-    const turnContent = historyAfter.slice(historyBeforeLength);
+    let turnContent = historyAfter.slice(historyBeforeLength);
+    if (turnContent.length === 0 || !turnContent.some(c => c.parts && c.parts.some(p => 'functionCall' in p || 'functionResponse' in p))) {
+      if ((response as any).automaticFunctionCallingHistory && Array.isArray((response as any).automaticFunctionCallingHistory)) {
+        turnContent = (response as any).automaticFunctionCallingHistory;
+        trace("[sendMessageToAI] Extracted turn content from response.automaticFunctionCallingHistory:", turnContent);
+      }
+    }
 
     // Collect all tool calls and responses into ToolExchange objects
     const toolExchanges: ToolExchange[] = [];
@@ -497,84 +663,101 @@ export const sendMessageToAI = async (
                           }
 
                           if (innerJson) {
-                              // Transform args for Routes API V2
-                              const transformWaypoint = (wp: any) => {
-                                  const transformed: Record<string, any> = {};
-                                  const placeId = wp.placeId || wp.place_id;
-                                  const latLng = wp.latLng || wp.lat_lng;
-                                  
-                                  if (placeId) {
-                                      transformed.placeId = placeId;
-                                  } else if (latLng) {
-                                      transformed.location = {
-                                          latLng: {
-                                              latitude: latLng.latitude,
-                                              longitude: latLng.longitude
-                                          }
-                                      };
-                                  } else if (wp.address) {
-                                      transformed.address = wp.address;
-                                  }
-                                  return transformed;
-                              };
+                              const existingRoute =
+                                  innerJson.response?.route ||
+                                  innerJson.route ||
+                                  (Array.isArray(innerJson.routes) && innerJson.routes.length > 0 ? innerJson.routes[0] : null) ||
+                                  (Array.isArray(innerJson.response?.routes) && innerJson.response.routes.length > 0 ? innerJson.response.routes[0] : null);
 
-                              const origin = call.args.origin ? transformWaypoint(call.args.origin) : undefined;
-                              const destination = call.args.destination ? transformWaypoint(call.args.destination) : undefined;
-                              
-                              if (origin && destination) {
-                                  const routesParams: Record<string, any> = {
-                                      origin,
-                                      destination,
-                                      travelMode: call.args.travelMode || 'DRIVE',
-                                      routingPreference: (call.args.travelMode === 'DRIVE' || !call.args.travelMode) ? 'TRAFFIC_AWARE' : undefined,
-                                      computeAlternativeRoutes: false,
-                                      routeModifiers: { avoidTolls: false, avoidHighways: false, avoidFerries: false },
-                                      languageCode: 'en-US',
-                                      units: 'METRIC'
-                                  };
-                                  
-                                  const { data: routesData, error: routesError } = await callRoutesApiV2(routesParams);
-                                  
-                                  trace(`[MCP] Routes API response:`, routesData ? "Success" : "Error", routesError);
+                              const alreadyHasPolyline = Boolean(
+                                  existingRoute?.encodedPolyline || existingRoute?.polyline?.encodedPolyline
+                              );
+                              const alreadyHasMetrics =
+                                  typeof existingRoute?.distanceMeters === 'number' && Boolean(existingRoute?.duration);
 
-                                  if (routesData && routesData.routes && routesData.routes.length > 0) {
-                                      const polyline = routesData.routes[0].polyline?.encodedPolyline;
-                                      if (polyline) {
-                                          trace(`[MCP] Successfully fetched polyline. Length: ${polyline.length}`);
-                                          
-                                          // Merge into innerJson
-                                          if (innerJson.routes && innerJson.routes.length > 0) {
-                                              trace(`[MCP] Injecting polyline into innerJson.routes[0]`);
-                                              innerJson.routes[0].encodedPolyline = polyline;
-                                              innerJson.routes[0].polyline = { encodedPolyline: polyline };
-                                              if (!innerJson.routes[0].origin) innerJson.routes[0].origin = call.args.origin;
-                                              if (!innerJson.routes[0].destination) innerJson.routes[0].destination = call.args.destination;
-                                          } else if (innerJson.route) {
-                                              trace(`[MCP] Injecting polyline into innerJson.route`);
-                                              innerJson.route.encodedPolyline = polyline;
-                                              if (!innerJson.route.origin) innerJson.route.origin = call.args.origin;
-                                              if (!innerJson.route.destination) innerJson.route.destination = call.args.destination;
-                                          } else {
-                                              // If structure is unexpected, try to force it
-                                              trace(`[MCP] WARNING: No 'routes' or 'route' field. Creating 'routes' array.`);
-                                              innerJson.routes = [{
-                                                  encodedPolyline: polyline,
-                                                  polyline: { encodedPolyline: polyline },
-                                                  origin: call.args.origin,
-                                                  destination: call.args.destination
-                                              }];
-                                          }
-
-                                          // Save back to textContentPart
-                                          if (textContentPart) {
-                                              textContentPart.text = JSON.stringify(innerJson);
-                                              // Also update responseJson if it was unwrapped (reference)
-                                          }
-                                      } else {
-                                          trace(`[MCP] Routes API returned routes but NO polyline.`);
+                              if (alreadyHasPolyline && alreadyHasMetrics) {
+                                  trace(`[MCP] compute_routes response already contains polyline, distanceMeters, and duration. Skipping redundant hydration.`);
+                              } else {
+                                  // Transform args for Routes API V2
+                                  const transformWaypoint = (wp: any) => {
+                                      const transformed: Record<string, any> = {};
+                                      const placeId = wp.placeId || wp.place_id;
+                                      const latLng = wp.latLng || wp.lat_lng;
+                                      
+                                      if (placeId) {
+                                          transformed.placeId = placeId;
+                                      } else if (latLng) {
+                                          transformed.location = {
+                                              latLng: {
+                                                  latitude: latLng.latitude,
+                                                  longitude: latLng.longitude
+                                              }
+                                          };
+                                      } else if (wp.address) {
+                                          transformed.address = wp.address;
                                       }
-                                  } else if (routesError) {
-                                      console.error(`[MCP] Failed to hydrate route: ${routesError}`);
+                                      return transformed;
+                                  };
+
+                                  const origin = call.args.origin ? transformWaypoint(call.args.origin) : undefined;
+                                  const destination = call.args.destination ? transformWaypoint(call.args.destination) : undefined;
+                                  
+                                  if (origin && destination) {
+                                      const routesParams: Record<string, any> = {
+                                          origin,
+                                          destination,
+                                          travelMode: call.args.travelMode || 'DRIVE',
+                                          routingPreference: (call.args.travelMode === 'DRIVE' || !call.args.travelMode) ? 'TRAFFIC_AWARE' : undefined,
+                                          computeAlternativeRoutes: false,
+                                          routeModifiers: { avoidTolls: false, avoidHighways: false, avoidFerries: false },
+                                          languageCode: 'en-US',
+                                          units: 'METRIC'
+                                      };
+                                      
+                                      const { data: routesData, error: routesError } = await callRoutesApiV2(routesParams);
+                                      
+                                      trace(`[MCP] Routes API response:`, routesData ? "Success" : "Error", routesError);
+
+                                      if (routesData && routesData.routes && routesData.routes.length > 0) {
+                                          const apiRoute = routesData.routes[0];
+                                          const polyline = apiRoute.polyline?.encodedPolyline;
+                                          if (polyline) {
+                                              trace(`[MCP] Successfully fetched polyline. Length: ${polyline.length}`);
+                                              
+                                              if (existingRoute) {
+                                                  trace(`[MCP] Injecting polyline and route metrics into existing route object`);
+                                                  existingRoute.encodedPolyline = polyline;
+                                                  if (existingRoute.distanceMeters === undefined && apiRoute.distanceMeters !== undefined) {
+                                                      existingRoute.distanceMeters = apiRoute.distanceMeters;
+                                                  }
+                                                  if (!existingRoute.duration && apiRoute.duration) {
+                                                      existingRoute.duration = apiRoute.duration;
+                                                  }
+                                                  if (!existingRoute.origin) existingRoute.origin = call.args.origin;
+                                                  if (!existingRoute.destination) existingRoute.destination = call.args.destination;
+                                              } else {
+                                                  trace(`[MCP] Creating 'routes' array with full route metrics and polyline.`);
+                                                  innerJson.routes = [{
+                                                      distanceMeters: apiRoute.distanceMeters,
+                                                      duration: apiRoute.duration,
+                                                      travelMode: call.args.travelMode || 'DRIVE',
+                                                      encodedPolyline: polyline,
+                                                      polyline: { encodedPolyline: polyline },
+                                                      origin: call.args.origin,
+                                                      destination: call.args.destination
+                                                  }];
+                                              }
+
+                                              // Save back to textContentPart
+                                              if (textContentPart) {
+                                                  textContentPart.text = JSON.stringify(innerJson);
+                                              }
+                                          } else {
+                                              trace(`[MCP] Routes API returned routes but NO polyline.`);
+                                          }
+                                      } else if (routesError) {
+                                          console.error(`[MCP] Failed to hydrate route: ${routesError}`);
+                                      }
                                   }
                               }
                           }
@@ -616,8 +799,8 @@ export const sendMessageToAI = async (
     // We explicitly extract the text content.
     let textContent = "";
     try {
-        // @ts-ignore: Handle potential getter or method
-        textContent = typeof response.text === 'function' ? response.text() : response.text;
+        const rawText = (response as { text?: string | (() => string) }).text;
+        textContent = typeof rawText === 'function' ? rawText.call(response) : (rawText ?? '');
     } catch (e) {
         console.warn("Could not extract text from response:", e);
     }

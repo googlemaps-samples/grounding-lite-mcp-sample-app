@@ -148,7 +148,7 @@ export const getElevationForLocations = async (
     const locationsString = locations.map(loc => `${loc.latitude},${loc.longitude}`).join('|');
     const ELEVATION_API_ENDPOINT = `https://maps.googleapis.com/maps/api/elevation/json?locations=${locationsString}&key=${serverApiKey}`;
 
-    trace(`[Elevation API] Calling GET ${ELEVATION_API_ENDPOINT}`);
+    trace(`[Elevation API] Calling GET https://maps.googleapis.com/maps/api/elevation/json?locations=${locationsString}`);
 
     const response = await fetch(ELEVATION_API_ENDPOINT);
 
